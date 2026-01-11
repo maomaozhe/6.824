@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -76,10 +77,9 @@ const (
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.state == StateLeader
 }
 
 // save Raft's persistent state to stable storage,
@@ -116,21 +116,88 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-// example RequestVote RPC arguments structure.
+// RequestVoteArgs example RequestVote RPC arguments structure.
 // field names must start with capital letters!
+// 字段名大写开头才能跨网络序列化
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term        int //候选人的任期
+	CandidateId int //候选人 ID
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int  //接收者任期
+	VoteGranted bool //是否投票
 }
 
 // example RequestVote RPC handler.
+// 投票逻辑
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
+	//任期比自己大，退下 ！
+	if args.Term > rf.currentTerm {
+		fmt.Printf("[%d] 发现更大任期 %d, 退回 Follower\n", rf.me, reply.Term)
+		rf.currentTerm = args.Term
+		rf.state = StateFollower
+		rf.votedFor = -1
+	}
+	//是否投票
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		rf.votedFor = args.CandidateId
+		rf.lastHeartbeat = time.Now() //投了票也算一次心跳
+		reply.VoteGranted = true
+	} else {
+		reply.VoteGranted = false
+	}
+	reply.Term = rf.currentTerm
+	return
+}
+
+// handler
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+	//承认对方是leader
+	rf.lastHeartbeat = time.Now()
+
+	//对方任期高
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+
+	}
+	rf.state = StateFollower
+
+	reply.Term = rf.currentTerm
+	reply.Success = true
+}
+
+type AppendEntriesArgs struct {
+	Term     int // Leader 的任期
+	LeaderId int // Leader 的 ID
+	// 2B 会加：PrevLogIndex, PrevLogTerm, Entries, LeaderCommit
+}
+
+type AppendEntriesReply struct {
+	Term    int  // 接收者的当前任期
+	Success bool // 2A 里暂时只看 Term
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -162,6 +229,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -224,6 +296,7 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) startElection() {
+	fmt.Printf("[%d] 开始选举, Term: %d\n", rf.me, rf.currentTerm)
 	rf.mu.Lock()
 	rf.state = StateCandidate
 	rf.currentTerm++
@@ -259,8 +332,9 @@ func (rf *Raft) startElection() {
 
 				if rf.state == StateCandidate && reply.VoteGranted {
 					votes++
-					if votes >= len(rf.peers)/2 {
+					if votes > len(rf.peers)/2 {
 						rf.state = StateLeader
+						fmt.Printf("[%d] 选上了老大, Term: %d\n", rf.me, rf.currentTerm)
 						//变成leader, 速速心跳
 						go rf.broadcastHeartbeat()
 					}
@@ -268,6 +342,51 @@ func (rf *Raft) startElection() {
 
 			}
 		}(i)
+	}
+
+}
+
+func (rf *Raft) broadcastHeartbeat() {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(peerIndex int) {
+			rf.mu.Lock()
+			if rf.state != StateLeader { //防止下台
+				rf.mu.Unlock()
+				return
+			}
+			args := AppendEntriesArgs{
+				Term:     rf.currentTerm,
+				LeaderId: rf.me,
+			}
+			rf.mu.Unlock()
+			reply := AppendEntriesReply{}
+			if rf.sendAppendEntries(peerIndex, &args, &reply) {
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					fmt.Printf("[%d] 发现更大任期 %d, 退回 Follower\n", rf.me, reply.Term)
+					rf.state = StateFollower
+					rf.currentTerm = reply.Term
+					rf.votedFor = -1
+				}
+				rf.mu.Unlock()
+
+			}
+		}(i)
+	}
+}
+
+func (rf *Raft) heartbeatTicker() {
+
+	for rf.killed() == false {
+		time.Sleep(100 * time.Millisecond)
+		rf.mu.Lock()
+		if rf.state == StateLeader {
+			go rf.broadcastHeartbeat()
+		}
+		rf.mu.Unlock()
 	}
 
 }
@@ -297,6 +416,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastHeartbeat = time.Now()
 	//开启心跳检测计时器
 	go rf.ticker()
+	go rf.heartbeatTicker()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
